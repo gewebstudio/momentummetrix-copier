@@ -4,12 +4,12 @@ Monitors Telegram channels for trading signals and forwards to MT5 via webhook
 """
 import asyncio
 import os
+import re
 import json
 import logging
 import httpx
 from pyrogram import Client, filters
 from pyrogram.types import Message
-import anthropic
 
 # Logging
 logging.basicConfig(
@@ -19,74 +19,109 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Config from environment
-API_ID       = int(os.environ['TELEGRAM_API_ID'])
-API_HASH     = os.environ['TELEGRAM_API_HASH']
-WEBHOOK_BASE = os.environ['WEBHOOK_BASE_URL']  # your Next.js app URL
-ANTHROPIC_KEY = os.environ['ANTHROPIC_API_KEY']
-PORT         = int(os.environ.get('PORT', 8000))
-
-# Firestore REST API for reading user configs
+API_ID        = int(os.environ['TELEGRAM_API_ID'])
+API_HASH      = os.environ['TELEGRAM_API_HASH']
+WEBHOOK_BASE  = os.environ['WEBHOOK_BASE_URL']
 FIREBASE_PROJECT = os.environ.get('FIREBASE_PROJECT_ID', 'mt5-dashboard-bd063')
-
-# Anthropic client
-claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+PORT          = int(os.environ.get('PORT', 8000))
 
 # Active Pyrogram clients per user
-# { userId: { client, channels: [list] } }
+# { userId: { client, channels } }
 active_clients: dict[str, dict] = {}
 
+# Known trading symbols
+SYMBOLS = [
+    'XAUUSD', 'XAGUSD',
+    'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD',
+    'EURGBP', 'EURJPY', 'GBPJPY', 'EURCHF', 'AUDCAD', 'AUDCHF', 'AUDJPY',
+    'AUDNZD', 'CADCHF', 'CADJPY', 'CHFJPY', 'EURCAD', 'EURAUD', 'EURNZD',
+    'GBPAUD', 'GBPCAD', 'GBPCHF', 'GBPNZD', 'NZDCAD', 'NZDCHF', 'NZDJPY',
+    'USDNOK', 'USDSEK', 'USDSGD', 'USDZAR', 'USDMXN',
+    'BTCUSD', 'ETHUSD', 'LTCUSD', 'XRPUSD',
+    'US30', 'US500', 'NAS100', 'UK100', 'GER40',
+    'USOIL', 'UKOIL',
+]
 
-async def parse_signal_with_claude(message_text: str) -> dict | None:
-    """Use Claude to extract trading signal from any message format"""
-    try:
-        response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": f"""You are a trading signal parser. Extract trading signal data from this Telegram message.
 
-Message:
-{message_text}
+def parse_signal_regex(text: str) -> dict | None:
+    """Parse trading signal from message text using regex"""
+    text_clean = text.strip()
+    text_upper = text_clean.upper()
 
-If this message contains a trading signal, respond with ONLY a JSON object:
-{{
-  "symbol": "XAUUSD",
-  "action": "BUY",
-  "entry": 3045.50,
-  "sl": 3020.00,
-  "tp1": 3070.00,
-  "tp2": 3100.00,
-  "tp3": null,
-  "lotSize": null,
-  "comment": "Telegram Signal"
-}}
+    # --- Detect action ---
+    action = None
 
-Rules:
-- symbol: normalize to broker format (XAUUSD, EURUSD, GBPUSD etc)
-- action: must be BUY, SELL, CLOSE_BUY, CLOSE_SELL, or CLOSE_ALL
-- entry/sl/tp: extract price levels as numbers, null if not mentioned
-- lotSize: extract if mentioned, null otherwise
-- If this is NOT a trading signal (news, commentary, etc), respond with: {{"signal": false}}
+    # Close signals first
+    if any(w in text_upper for w in ['CLOSE ALL', 'CLOSE_ALL', 'EXIT ALL']):
+        action = 'CLOSE_ALL'
+    elif any(w in text_upper for w in ['CLOSE BUY', 'CLOSE_BUY', 'EXIT BUY']):
+        action = 'CLOSE_BUY'
+    elif any(w in text_upper for w in ['CLOSE SELL', 'CLOSE_SELL', 'EXIT SELL']):
+        action = 'CLOSE_SELL'
+    elif re.search(r'\bBUY\b', text_upper) and not re.search(r'\bSELL\b', text_upper):
+        action = 'BUY'
+    elif re.search(r'\bSELL\b', text_upper) and not re.search(r'\bBUY\b', text_upper):
+        action = 'SELL'
+    elif re.search(r'\bLONG\b', text_upper):
+        action = 'BUY'
+    elif re.search(r'\bSHORT\b', text_upper):
+        action = 'SELL'
 
-Respond with JSON only, no explanation."""
-            }]
-        )
-
-        text = response.content[0].text.strip()
-        data = json.loads(text)
-
-        if data.get("signal") is False:
-            return None
-
-        if not data.get("symbol") or not data.get("action"):
-            return None
-
-        return data
-
-    except Exception as e:
-        log.error(f"Claude parse error: {e}")
+    if not action:
         return None
+
+    # --- Detect symbol ---
+    symbol = None
+    for s in SYMBOLS:
+        # Match symbol with word boundaries or slashes (e.g. XAU/USD or XAUUSD)
+        pattern = s[:3] + r'[/\s]?' + s[3:]
+        if re.search(pattern, text_upper):
+            symbol = s
+            break
+
+    if not symbol:
+        return None
+
+    # --- Extract price levels ---
+    # Look for labeled prices first
+    def extract_labeled(labels: list[str]) -> float | None:
+        for label in labels:
+            match = re.search(label + r'[:\s]*(\d+\.?\d*)', text_upper)
+            if match:
+                val = float(match.group(1))
+                if val > 0.1:
+                    return val
+        return None
+
+    entry = extract_labeled(['ENTRY', 'ENTER', 'PRICE', 'EP', 'BUY AT', 'SELL AT', 'BUY@', 'SELL@', '@'])
+    sl    = extract_labeled(['SL', 'STOP LOSS', 'STOP', 'S/L', 'STOPLOSS'])
+    tp1   = extract_labeled(['TP1', 'TP 1', 'T1', 'TARGET 1', 'TAKE PROFIT 1'])
+    tp2   = extract_labeled(['TP2', 'TP 2', 'T2', 'TARGET 2', 'TAKE PROFIT 2'])
+    tp3   = extract_labeled(['TP3', 'TP 3', 'T3', 'TARGET 3', 'TAKE PROFIT 3'])
+
+    # If no labeled TP, try generic TP
+    if not tp1:
+        tp1 = extract_labeled(['TP', 'TAKE PROFIT', 'T/P', 'TARGET'])
+
+    # Fallback: extract all numbers if nothing labeled
+    if not entry and not sl and not tp1:
+        all_prices = [float(p) for p in re.findall(r'\d+\.?\d+', text_clean) if float(p) > 0.1]
+        if len(all_prices) >= 1: entry = all_prices[0]
+        if len(all_prices) >= 2: sl    = all_prices[1]
+        if len(all_prices) >= 3: tp1   = all_prices[2]
+        if len(all_prices) >= 4: tp2   = all_prices[3]
+
+    log.info(f"Parsed: {action} {symbol} entry={entry} sl={sl} tp1={tp1} tp2={tp2}")
+
+    return {
+        'symbol': symbol,
+        'action': action,
+        'entry': entry,
+        'sl': sl,
+        'tp1': tp1,
+        'tp2': tp2,
+        'tp3': tp3,
+    }
 
 
 async def forward_signal(user_id: str, account_id: str | None, signal: dict, channel: str):
@@ -98,12 +133,11 @@ async def forward_signal(user_id: str, account_id: str | None, signal: dict, cha
             "price": signal.get("entry"),
             "sl": signal.get("sl"),
             "tp": signal.get("tp1") or signal.get("tp"),
-            "lotSize": signal.get("lotSize") or 0.01,
-            "magic": 88888,  # Magic number for Telegram signals
-            "comment": f"TG:{channel}",
+            "lotSize": 0.01,
+            "magic": 88888,
+            "comment": f"TG:{channel[:20]}",
         }
 
-        # Build webhook URL with account if specified
         url = f"{WEBHOOK_BASE}/api/webhook/tradingview"
         if account_id:
             url += f"?account={account_id}"
@@ -111,7 +145,7 @@ async def forward_signal(user_id: str, account_id: str | None, signal: dict, cha
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=payload)
             if resp.status_code == 200:
-                log.info(f"✅ Signal forwarded: {payload['action']} {payload['symbol']} for user {user_id}")
+                log.info(f"✅ Forwarded: {payload['action']} {payload['symbol']} for user {user_id}")
             else:
                 log.error(f"❌ Webhook error {resp.status_code}: {resp.text}")
 
@@ -137,10 +171,12 @@ async def get_user_configs() -> list[dict]:
                 config = {
                     "userId": fields.get("userId", {}).get("stringValue", ""),
                     "sessionString": fields.get("sessionString", {}).get("stringValue", ""),
-                    "channels": [c.get("stringValue", "") for c in fields.get("channels", {}).get("arrayValue", {}).get("values", [])],
+                    "channels": [
+                        c.get("stringValue", "")
+                        for c in fields.get("channels", {}).get("arrayValue", {}).get("values", [])
+                    ],
                     "accountId": fields.get("accountId", {}).get("stringValue", ""),
                     "enabled": fields.get("enabled", {}).get("booleanValue", True),
-                    "phoneNumber": fields.get("phoneNumber", {}).get("stringValue", ""),
                 }
                 if config["sessionString"] and config["enabled"]:
                     configs.append(config)
@@ -157,7 +193,6 @@ async def start_user_client(config: dict):
     user_id = config["userId"]
 
     if user_id in active_clients:
-        log.info(f"Client already running for user {user_id}")
         return
 
     try:
@@ -169,16 +204,16 @@ async def start_user_client(config: dict):
             in_memory=True,
         )
 
-        channels = config.get("channels", [])
+        channels  = config.get("channels", [])
         account_id = config.get("accountId", "")
 
         @app.on_message(filters.channel)
         async def handle_message(client: Client, message: Message):
             try:
-                # Check if message is from a monitored channel
                 chat = message.chat
                 chat_username = f"@{chat.username}" if chat.username else str(chat.id)
 
+                # Check if monitored channel
                 monitored = any(
                     ch.lower().strip("@") == chat_username.lower().strip("@") or
                     ch == str(chat.id)
@@ -192,17 +227,15 @@ async def start_user_client(config: dict):
                 if not text or len(text) < 10:
                     return
 
-                log.info(f"📨 Message from {chat_username} for user {user_id}: {text[:100]}")
+                log.info(f"📨 [{chat_username}] {text[:120]}")
 
-                # Parse with Claude
-                signal = await parse_signal_with_claude(text)
+                # Parse signal
+                signal = parse_signal_regex(text)
                 if not signal:
-                    log.info(f"Not a signal, skipping")
+                    log.info("Not a signal, skipping")
                     return
 
-                log.info(f"🎯 Signal parsed: {signal['action']} {signal['symbol']}")
-
-                # Forward to webhook
+                log.info(f"🎯 Signal: {signal['action']} {signal['symbol']}")
                 await forward_signal(user_id, account_id, signal, chat_username)
 
             except Exception as e:
@@ -210,7 +243,7 @@ async def start_user_client(config: dict):
 
         await app.start()
         me = await app.get_me()
-        log.info(f"✅ Started client for {me.first_name} ({user_id}) monitoring {len(channels)} channels")
+        log.info(f"✅ Client started: {me.first_name} ({user_id}) — {len(channels)} channels")
 
         active_clients[user_id] = {
             "client": app,
@@ -219,7 +252,7 @@ async def start_user_client(config: dict):
         }
 
     except Exception as e:
-        log.error(f"Failed to start client for user {user_id}: {e}")
+        log.error(f"Failed to start client for {user_id}: {e}")
 
 
 async def stop_user_client(user_id: str):
@@ -229,9 +262,9 @@ async def stop_user_client(user_id: str):
     try:
         await active_clients[user_id]["client"].stop()
         del active_clients[user_id]
-        log.info(f"Stopped client for user {user_id}")
+        log.info(f"Stopped client for {user_id}")
     except Exception as e:
-        log.error(f"Error stopping client for {user_id}: {e}")
+        log.error(f"Error stopping {user_id}: {e}")
 
 
 async def sync_clients():
@@ -239,12 +272,12 @@ async def sync_clients():
     while True:
         try:
             configs = await get_user_configs()
-            config_user_ids = {c["userId"] for c in configs}
+            config_ids = {c["userId"] for c in configs}
 
-            # Stop clients no longer in config
-            for user_id in list(active_clients.keys()):
-                if user_id not in config_user_ids:
-                    await stop_user_client(user_id)
+            # Stop removed clients
+            for uid in list(active_clients.keys()):
+                if uid not in config_ids:
+                    await stop_user_client(uid)
 
             # Start new clients
             for config in configs:
@@ -256,11 +289,11 @@ async def sync_clients():
         except Exception as e:
             log.error(f"Sync error: {e}")
 
-        await asyncio.sleep(60)  # Re-sync every minute
+        await asyncio.sleep(60)
 
 
 async def health_server():
-    """Simple HTTP health check endpoint for Railway"""
+    """Simple HTTP health check for Railway"""
     from aiohttp import web
 
     async def health(request):
@@ -278,21 +311,17 @@ async def health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info(f"Health server running on port {PORT}")
+    log.info(f"Health server on port {PORT}")
 
 
 async def main():
-    log.info("🚀 MomentumMetrix Telegram Copier starting...")
-
-    # Start health server
+    log.info("🚀 MomentumMetrix Copier starting...")
     await health_server()
 
-    # Initial sync
     configs = await get_user_configs()
     for config in configs:
         await start_user_client(config)
 
-    # Keep syncing
     await sync_clients()
 
 
