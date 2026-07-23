@@ -7,6 +7,7 @@ import os
 import logging
 from pyrogram import Client
 from aiohttp import web
+from aiohttp.web_middlewares import middleware
 
 log = logging.getLogger(__name__)
 
@@ -15,21 +16,34 @@ API_HASH = os.environ['TELEGRAM_API_HASH']
 PORT     = int(os.environ.get('PORT', 8000))
 
 # Temporary storage for pending auth sessions
-# { phone: { client, phone_code_hash } }
 pending_auth: dict[str, dict] = {}
+
+
+@middleware
+async def cors_middleware(request, handler):
+    if request.method == 'OPTIONS':
+        response = web.Response()
+    else:
+        try:
+            response = await handler(request)
+        except Exception as e:
+            response = web.json_response({"error": str(e)}, status=500)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
 
 
 async def send_otp(request):
     """Step 1: Send OTP to phone number"""
     try:
         data = await request.json()
-        phone = data.get("phone", "").strip()
+        phone   = data.get("phone", "").strip()
         user_id = data.get("userId", "").strip()
 
         if not phone or not user_id:
             return web.json_response({"error": "phone and userId required"}, status=400)
 
-        # Create temporary client for auth
         app = Client(
             name=f"auth_{user_id}",
             api_id=API_ID,
@@ -57,45 +71,44 @@ async def send_otp(request):
 async def verify_otp(request):
     """Step 2: Verify OTP and return session string"""
     try:
-        data = await request.json()
-        phone = data.get("phone", "").strip()
-        code  = data.get("code", "").strip()
-        password = data.get("password", "").strip()  # 2FA if enabled
+        data     = await request.json()
+        phone    = data.get("phone", "").strip()
+        code     = data.get("code", "").strip()
+        password = data.get("password", "").strip()
 
         if not phone or not code:
             return web.json_response({"error": "phone and code required"}, status=400)
 
         pending = pending_auth.get(phone)
         if not pending:
-            return web.json_response({"error": "No pending auth for this phone"}, status=400)
+            return web.json_response({"error": "No pending auth for this phone. Please request a new code."}, status=400)
 
         app = pending["client"]
 
         try:
             await app.sign_in(phone, pending["phone_code_hash"], code)
         except Exception as e:
-            error_str = str(e)
-            if "two-steps" in error_str.lower() or "password" in error_str.lower():
+            error_str = str(e).lower()
+            if "two-steps" in error_str or "password" in error_str or "2fa" in error_str:
                 if not password:
                     return web.json_response({"error": "2FA_REQUIRED"}, status=400)
                 await app.check_password(password)
             else:
                 raise
 
-        # Export session string
         session_string = await app.export_session_string()
         me = await app.get_me()
 
         await app.disconnect()
         del pending_auth[phone]
 
-        log.info(f"✅ Auth successful for {me.first_name} ({phone})")
+        log.info(f"Auth successful for {me.first_name} ({phone})")
 
         return web.json_response({
             "success": True,
             "sessionString": session_string,
             "name": me.first_name,
-            "username": me.username,
+            "username": me.username or "",
             "userId": pending["user_id"],
         })
 
@@ -104,14 +117,20 @@ async def verify_otp(request):
         return web.json_response({"error": str(e)}, status=500)
 
 
+async def options_handler(request):
+    return web.Response()
+
+
 async def health(request):
-    return web.json_response({"status": "ok", "service": "auth"})
+    return web.json_response({"status": "ok", "service": "MomentumMetrix Telegram Copier"})
 
 
 async def start_auth_server():
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app.router.add_post("/auth/send-otp", send_otp)
     app.router.add_post("/auth/verify-otp", verify_otp)
+    app.router.add_options("/auth/send-otp", options_handler)
+    app.router.add_options("/auth/verify-otp", options_handler)
     app.router.add_get("/health", health)
     app.router.add_get("/", health)
 
