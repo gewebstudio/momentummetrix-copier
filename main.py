@@ -116,71 +116,45 @@ async def save_signal_to_firestore(
     execution_mode: str,
     account_id: str,
 ) -> str | None:
-    """Save signal to Firestore telegram_signals collection, return doc ID"""
     try:
-        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT}/databases/(default)/documents/telegram_signals"
-        now = datetime.now(timezone.utc).isoformat()
-
         payload = {
-            "fields": {
-                "userId":        {"stringValue": user_id},
-                "channel":       {"stringValue": channel},
-                "symbol":        {"stringValue": signal.get('symbol', '')},
-                "action":        {"stringValue": signal.get('action', '')},
-                "entry":         {"doubleValue": signal.get('entry') or 0},
-                "sl":            {"doubleValue": signal.get('sl') or 0},
-                "tp":            {"doubleValue": signal.get('tp1') or 0},
-                "tp2":           {"doubleValue": signal.get('tp2') or 0},
-                "tp3":           {"doubleValue": signal.get('tp3') or 0},
-                "lotSize":       {"doubleValue": lot_size},
-                "status":        {"stringValue": "PENDING"},
-                "executionMode": {"stringValue": execution_mode},
-                "accountId":     {"stringValue": account_id or ''},
-                "createdAt":     {"timestampValue": now},
-                "executedAt":    {"nullValue": None},
-                "error":         {"nullValue": None},
-            }
+            "userId":        user_id,
+            "channel":       channel,
+            "symbol":        signal.get('symbol', ''),
+            "action":        signal.get('action', ''),
+            "entry":         signal.get('entry') or 0,
+            "sl":            signal.get('sl') or 0,
+            "tp":            signal.get('tp1') or 0,
+            "tp2":           signal.get('tp2') or 0,
+            "tp3":           signal.get('tp3') or 0,
+            "lotSize":       lot_size,
+            "status":        "PENDING",
+            "executionMode": execution_mode,
+            "accountId":     account_id or '',
         }
-
+        url = f"{WEBHOOK_BASE}/api/telegram-signal"
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=payload)
-            if resp.status_code in [200, 201]:
+            if resp.status_code == 200:
                 data = resp.json()
-                # Extract doc ID from name field
-                name = data.get('name', '')
-                doc_id = name.split('/')[-1] if name else None
-                log.info(f"Signal saved to Firestore: {doc_id}")
-                return doc_id
+                log.info(f"Signal saved: {data.get('id')}")
+                return data.get('id')
             else:
-                log.error(f"Firestore save error: {resp.status_code} {resp.text}")
+                log.error(f"Save signal error: {resp.status_code}")
                 return None
-
     except Exception as e:
         log.error(f"Save signal error: {e}")
         return None
 
 
 async def update_signal_status(doc_id: str, status: str, error: str = None):
-    """Update signal status in Firestore"""
     try:
-        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT}/databases/(default)/documents/telegram_signals/{doc_id}"
-        now = datetime.now(timezone.utc).isoformat()
-
-        fields = {
-            "status":     {"stringValue": status},
-            "executedAt": {"timestampValue": now},
-        }
-        if error:
-            fields["error"] = {"stringValue": error}
-
-        payload = {"fields": fields}
-        update_mask = "status,executedAt" + (",error" if error else "")
-
+        url = f"{WEBHOOK_BASE}/api/telegram-signal"
+        payload = {"id": doc_id, "status": status, "error": error}
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.patch(f"{url}?updateMask.fieldPaths=status&updateMask.fieldPaths=executedAt", json=payload)
-
+            await client.patch(url, json=payload)
     except Exception as e:
-        log.error(f"Update signal status error: {e}")
+        log.error(f"Update signal error: {e}")
 
 
 async def forward_signal_to_webhook(
