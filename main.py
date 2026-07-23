@@ -406,6 +406,16 @@ async def start_user_client(config: dict):
 
         await tg_client.start()
         me = await tg_client.get_me()
+
+        # Pre-cache all monitored channels
+        for ch in channels:
+            try:
+                username = ch.get("username", "").strip("@")
+                if username:
+                    await tg_client.get_chat(username)
+                    log.info(f"Cached channel: {username}")
+            except Exception as e:
+                log.warning(f"Could not cache {ch.get('username')}: {e}")
         enabled_channels = [ch["username"] for ch in channels if ch.get("enabled")]
         log.info(f"✅ Client: {me.first_name} ({user_id}) — {len(enabled_channels)} channels")
 
