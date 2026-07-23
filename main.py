@@ -322,7 +322,7 @@ async def start_user_client(config: dict):
         async def handle_message(client: Client, message: Message):
             try:
                 chat = message.chat
-                chat_username = f"@{chat.username}" if chat.username else str(chat.id)
+                chat_username = chat.title or f"@{chat.username}" if chat.username else str(chat.id)
                 chat_key = chat_username.lower().strip("@")
 
                 # Check if monitored
@@ -351,7 +351,7 @@ async def start_user_client(config: dict):
                 # Save to Firestore first
                 doc_id = await save_signal_to_firestore(
                     user_id=user_id,
-                    channel=chat_username,
+                    channel=chat.title or chat_username,  # Use title instead of username
                     signal=signal,
                     lot_size=lot_size,
                     execution_mode=exec_mode,
