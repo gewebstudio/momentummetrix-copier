@@ -8,36 +8,31 @@ import re
 import json
 import logging
 import httpx
+from datetime import datetime, timezone, timedelta
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 log = logging.getLogger(__name__)
 
-# Config from environment
-_raw_id      = os.environ['TELEGRAM_API_ID'].split('=')[-1].strip().split('\\n')[0].strip()
-API_ID       = int(_raw_id)
-API_HASH     = os.environ['TELEGRAM_API_HASH'].split('=')[-1].strip().split('\\n')[0].strip()
-WEBHOOK_BASE = os.environ['WEBHOOK_BASE_URL'].split('=')[-1].strip().split('\\n')[0].strip()
+API_ID           = int(os.environ['TELEGRAM_API_ID'])
+API_HASH         = os.environ['TELEGRAM_API_HASH']
+WEBHOOK_BASE     = os.environ['WEBHOOK_BASE_URL']
 FIREBASE_PROJECT = os.environ.get('FIREBASE_PROJECT_ID', 'mt5-dashboard-bd063')
-PORT         = int(os.environ.get('PORT', 8000))
+PORT             = int(os.environ.get('PORT', 8000))
+SIGNAL_RETENTION_DAYS = 7
 
-# Active Pyrogram clients per user
-# { userId: { client, channels } }
 active_clients: dict[str, dict] = {}
 
-# Known trading symbols
 SYMBOLS = [
     'XAUUSD', 'XAGUSD',
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD',
     'EURGBP', 'EURJPY', 'GBPJPY', 'EURCHF', 'AUDCAD', 'AUDCHF', 'AUDJPY',
     'AUDNZD', 'CADCHF', 'CADJPY', 'CHFJPY', 'EURCAD', 'EURAUD', 'EURNZD',
     'GBPAUD', 'GBPCAD', 'GBPCHF', 'GBPNZD', 'NZDCAD', 'NZDCHF', 'NZDJPY',
-    'USDNOK', 'USDSEK', 'USDSGD', 'USDZAR', 'USDMXN',
     'BTCUSD', 'ETHUSD', 'LTCUSD', 'XRPUSD',
     'US30', 'US500', 'NAS100', 'UK100', 'GER40',
     'USOIL', 'UKOIL',
@@ -45,19 +40,15 @@ SYMBOLS = [
 
 
 def parse_signal_regex(text: str) -> dict | None:
-    """Parse trading signal from message text using regex"""
     text_clean = text.strip()
     text_upper = text_clean.upper()
 
-    # --- Detect action ---
     action = None
-
-    # Close signals first
     if any(w in text_upper for w in ['CLOSE ALL', 'CLOSE_ALL', 'EXIT ALL']):
         action = 'CLOSE_ALL'
-    elif any(w in text_upper for w in ['CLOSE BUY', 'CLOSE_BUY', 'EXIT BUY']):
+    elif any(w in text_upper for w in ['CLOSE BUY', 'CLOSE_BUY']):
         action = 'CLOSE_BUY'
-    elif any(w in text_upper for w in ['CLOSE SELL', 'CLOSE_SELL', 'EXIT SELL']):
+    elif any(w in text_upper for w in ['CLOSE SELL', 'CLOSE_SELL']):
         action = 'CLOSE_SELL'
     elif re.search(r'\bBUY\b', text_upper) and not re.search(r'\bSELL\b', text_upper):
         action = 'BUY'
@@ -71,10 +62,8 @@ def parse_signal_regex(text: str) -> dict | None:
     if not action:
         return None
 
-    # --- Detect symbol ---
     symbol = None
     for s in SYMBOLS:
-        # Match symbol with word boundaries or slashes (e.g. XAU/USD or XAUUSD)
         pattern = s[:3] + r'[/\s]?' + s[3:]
         if re.search(pattern, text_upper):
             symbol = s
@@ -83,9 +72,7 @@ def parse_signal_regex(text: str) -> dict | None:
     if not symbol:
         return None
 
-    # --- Extract price levels ---
-    # Look for labeled prices first
-    def extract_labeled(labels: list[str]) -> float | None:
+    def extract_labeled(labels):
         for label in labels:
             match = re.search(label + r'[:\s]*(\d+\.?\d*)', text_upper)
             if match:
@@ -94,25 +81,21 @@ def parse_signal_regex(text: str) -> dict | None:
                     return val
         return None
 
-    entry = extract_labeled(['ENTRY', 'ENTER', 'PRICE', 'EP', 'BUY AT', 'SELL AT', 'BUY@', 'SELL@', '@'])
+    entry = extract_labeled(['ENTRY', 'ENTER', 'PRICE', 'EP', 'BUY AT', 'SELL AT', '@'])
     sl    = extract_labeled(['SL', 'STOP LOSS', 'STOP', 'S/L', 'STOPLOSS'])
-    tp1   = extract_labeled(['TP1', 'TP 1', 'T1', 'TARGET 1', 'TAKE PROFIT 1'])
-    tp2   = extract_labeled(['TP2', 'TP 2', 'T2', 'TARGET 2', 'TAKE PROFIT 2'])
-    tp3   = extract_labeled(['TP3', 'TP 3', 'T3', 'TARGET 3', 'TAKE PROFIT 3'])
+    tp1   = extract_labeled(['TP1', 'TP 1', 'T1', 'TARGET 1'])
+    tp2   = extract_labeled(['TP2', 'TP 2', 'T2', 'TARGET 2'])
+    tp3   = extract_labeled(['TP3', 'TP 3', 'T3', 'TARGET 3'])
 
-    # If no labeled TP, try generic TP
     if not tp1:
         tp1 = extract_labeled(['TP', 'TAKE PROFIT', 'T/P', 'TARGET'])
 
-    # Fallback: extract all numbers if nothing labeled
     if not entry and not sl and not tp1:
         all_prices = [float(p) for p in re.findall(r'\d+\.?\d+', text_clean) if float(p) > 0.1]
         if len(all_prices) >= 1: entry = all_prices[0]
         if len(all_prices) >= 2: sl    = all_prices[1]
         if len(all_prices) >= 3: tp1   = all_prices[2]
         if len(all_prices) >= 4: tp2   = all_prices[3]
-
-    log.info(f"Parsed: {action} {symbol} entry={entry} sl={sl} tp1={tp1} tp2={tp2}")
 
     return {
         'symbol': symbol,
@@ -125,17 +108,98 @@ def parse_signal_regex(text: str) -> dict | None:
     }
 
 
-async def forward_signal(user_id: str, account_id: str | None, signal: dict, channel: str):
+async def save_signal_to_firestore(
+    user_id: str,
+    channel: str,
+    signal: dict,
+    lot_size: float,
+    execution_mode: str,
+    account_id: str,
+) -> str | None:
+    """Save signal to Firestore telegram_signals collection, return doc ID"""
+    try:
+        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT}/databases/(default)/documents/telegram_signals"
+        now = datetime.now(timezone.utc).isoformat()
+
+        payload = {
+            "fields": {
+                "userId":        {"stringValue": user_id},
+                "channel":       {"stringValue": channel},
+                "symbol":        {"stringValue": signal.get('symbol', '')},
+                "action":        {"stringValue": signal.get('action', '')},
+                "entry":         {"doubleValue": signal.get('entry') or 0},
+                "sl":            {"doubleValue": signal.get('sl') or 0},
+                "tp":            {"doubleValue": signal.get('tp1') or 0},
+                "tp2":           {"doubleValue": signal.get('tp2') or 0},
+                "tp3":           {"doubleValue": signal.get('tp3') or 0},
+                "lotSize":       {"doubleValue": lot_size},
+                "status":        {"stringValue": "PENDING"},
+                "executionMode": {"stringValue": execution_mode},
+                "accountId":     {"stringValue": account_id or ''},
+                "createdAt":     {"timestampValue": now},
+                "executedAt":    {"nullValue": None},
+                "error":         {"nullValue": None},
+            }
+        }
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code in [200, 201]:
+                data = resp.json()
+                # Extract doc ID from name field
+                name = data.get('name', '')
+                doc_id = name.split('/')[-1] if name else None
+                log.info(f"Signal saved to Firestore: {doc_id}")
+                return doc_id
+            else:
+                log.error(f"Firestore save error: {resp.status_code} {resp.text}")
+                return None
+
+    except Exception as e:
+        log.error(f"Save signal error: {e}")
+        return None
+
+
+async def update_signal_status(doc_id: str, status: str, error: str = None):
+    """Update signal status in Firestore"""
+    try:
+        url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT}/databases/(default)/documents/telegram_signals/{doc_id}"
+        now = datetime.now(timezone.utc).isoformat()
+
+        fields = {
+            "status":     {"stringValue": status},
+            "executedAt": {"timestampValue": now},
+        }
+        if error:
+            fields["error"] = {"stringValue": error}
+
+        payload = {"fields": fields}
+        update_mask = "status,executedAt" + (",error" if error else "")
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.patch(f"{url}?updateMask.fieldPaths=status&updateMask.fieldPaths=executedAt", json=payload)
+
+    except Exception as e:
+        log.error(f"Update signal status error: {e}")
+
+
+async def forward_signal_to_webhook(
+    user_id: str,
+    account_id: str,
+    signal: dict,
+    lot_size: float,
+    channel: str,
+) -> bool:
     """Forward parsed signal to MomentumMetrix webhook"""
     try:
         payload = {
-            "symbol": signal.get("symbol", ""),
-            "action": signal.get("action", ""),
-            "price": signal.get("entry"),
-            "sl": signal.get("sl"),
-            "tp": signal.get("tp1") or signal.get("tp"),
-            "lotSize": 0.01,
-            "magic": 88888,
+            "symbol":  signal.get("symbol", ""),
+            "action":  signal.get("action", ""),
+            "price":   signal.get("entry"),
+            "sl":      signal.get("sl"),
+            "tp":      signal.get("tp1"),
+            "lotSize": lot_size,
+            "magic":   88888,
             "comment": f"TG:{channel[:20]}",
         }
 
@@ -146,16 +210,67 @@ async def forward_signal(user_id: str, account_id: str | None, signal: dict, cha
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=payload)
             if resp.status_code == 200:
-                log.info(f"✅ Forwarded: {payload['action']} {payload['symbol']} for user {user_id}")
+                log.info(f"✅ Forwarded: {payload['action']} {payload['symbol']}")
+                return True
             else:
                 log.error(f"❌ Webhook error {resp.status_code}: {resp.text}")
+                return False
 
     except Exception as e:
         log.error(f"Forward signal error: {e}")
+        return False
+
+
+async def cleanup_old_signals():
+    """Delete signals older than SIGNAL_RETENTION_DAYS days"""
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=SIGNAL_RETENTION_DAYS)).isoformat()
+        url = (
+            f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT}"
+            f"/databases/(default)/documents:runQuery"
+        )
+        query = {
+            "structuredQuery": {
+                "from": [{"collectionId": "telegram_signals"}],
+                "where": {
+                    "fieldFilter": {
+                        "field": {"fieldPath": "createdAt"},
+                        "op": "LESS_THAN",
+                        "value": {"timestampValue": cutoff}
+                    }
+                },
+                "limit": 100
+            }
+        }
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json=query)
+            if resp.status_code != 200:
+                return
+
+            results = resp.json()
+            deleted = 0
+            for result in results:
+                doc = result.get('document')
+                if not doc:
+                    continue
+                doc_name = doc.get('name', '')
+                if doc_name:
+                    del_resp = await client.delete(
+                        f"https://firestore.googleapis.com/v1/{doc_name}"
+                    )
+                    if del_resp.status_code == 200:
+                        deleted += 1
+
+            if deleted > 0:
+                log.info(f"🧹 Cleaned up {deleted} old signals")
+
+    except Exception as e:
+        log.error(f"Cleanup error: {e}")
 
 
 async def get_user_configs() -> list[dict]:
-    """Fetch active Telegram copier configs from Firestore REST API"""
+    """Fetch active Telegram copier configs from Firestore"""
     try:
         url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT}/databases/(default)/documents/telegram_copiers"
         async with httpx.AsyncClient(timeout=10) as client:
@@ -169,16 +284,34 @@ async def get_user_configs() -> list[dict]:
 
             for doc in docs:
                 fields = doc.get("fields", {})
+
+                # Parse channels array (new format with objects)
+                channels_raw = fields.get("channels", {}).get("arrayValue", {}).get("values", [])
+                channels = []
+                for ch in channels_raw:
+                    ch_fields = ch.get("mapValue", {}).get("fields", {})
+                    if ch_fields:
+                        channels.append({
+                            "username":      ch_fields.get("username", {}).get("stringValue", ""),
+                            "title":         ch_fields.get("title", {}).get("stringValue", ""),
+                            "enabled":       ch_fields.get("enabled", {}).get("booleanValue", True),
+                            "lotSize":       ch_fields.get("lotSize", {}).get("doubleValue", 0.01),
+                            "useTP1":        ch_fields.get("useTP1", {}).get("booleanValue", True),
+                            "useTP2":        ch_fields.get("useTP2", {}).get("booleanValue", False),
+                            "useTP3":        ch_fields.get("useTP3", {}).get("booleanValue", False),
+                            "breakeven":     ch_fields.get("breakeven", {}).get("booleanValue", False),
+                            "executionMode": ch_fields.get("executionMode", {}).get("stringValue", "auto"),
+                        })
+
                 config = {
-                    "userId": fields.get("userId", {}).get("stringValue", ""),
+                    "userId":        fields.get("userId", {}).get("stringValue", ""),
                     "sessionString": fields.get("sessionString", {}).get("stringValue", ""),
-                    "channels": [
-                        c.get("stringValue", "")
-                        for c in fields.get("channels", {}).get("arrayValue", {}).get("values", [])
-                    ],
-                    "accountId": fields.get("accountId", {}).get("stringValue", ""),
-                    "enabled": fields.get("enabled", {}).get("booleanValue", True),
+                    "accountId":     fields.get("accountId", {}).get("stringValue", ""),
+                    "enabled":       fields.get("enabled", {}).get("booleanValue", True),
+                    "executionMode": fields.get("executionMode", {}).get("stringValue", "auto"),
+                    "channels":      channels,
                 }
+
                 if config["sessionString"] and config["enabled"]:
                     configs.append(config)
 
@@ -192,12 +325,11 @@ async def get_user_configs() -> list[dict]:
 async def start_user_client(config: dict):
     """Start a Pyrogram client for a user"""
     user_id = config["userId"]
-
     if user_id in active_clients:
         return
 
     try:
-        app = Client(
+        tg_client = Client(
             name=f"user_{user_id}",
             api_id=API_ID,
             api_hash=API_HASH,
@@ -205,23 +337,26 @@ async def start_user_client(config: dict):
             in_memory=True,
         )
 
-        channels  = config.get("channels", [])
-        account_id = config.get("accountId", "")
+        channels       = config.get("channels", [])
+        account_id     = config.get("accountId", "")
+        global_mode    = config.get("executionMode", "auto")
 
-        @app.on_message(filters.channel)
+        # Build lookup: username → channel config
+        channel_map = {ch["username"].lower().strip("@"): ch for ch in channels if ch.get("enabled")}
+
+        @tg_client.on_message(filters.channel)
         async def handle_message(client: Client, message: Message):
             try:
                 chat = message.chat
                 chat_username = f"@{chat.username}" if chat.username else str(chat.id)
+                chat_key = chat_username.lower().strip("@")
 
-                # Check if monitored channel
-                monitored = any(
-                    ch.lower().strip("@") == chat_username.lower().strip("@") or
-                    ch == str(chat.id)
-                    for ch in channels
-                )
-
-                if not monitored:
+                # Check if monitored
+                ch_config = channel_map.get(chat_key)
+                if not ch_config:
+                    # Try by ID
+                    ch_config = channel_map.get(str(chat.id))
+                if not ch_config:
                     return
 
                 text = message.text or message.caption or ""
@@ -230,24 +365,52 @@ async def start_user_client(config: dict):
 
                 log.info(f"📨 [{chat_username}] {text[:120]}")
 
-                # Parse signal
                 signal = parse_signal_regex(text)
                 if not signal:
-                    log.info("Not a signal, skipping")
                     return
 
-                log.info(f"🎯 Signal: {signal['action']} {signal['symbol']}")
-                await forward_signal(user_id, account_id, signal, chat_username)
+                log.info(f"🎯 {signal['action']} {signal['symbol']}")
+
+                lot_size = ch_config.get("lotSize", 0.01)
+                exec_mode = ch_config.get("executionMode", global_mode)
+
+                # Save to Firestore first
+                doc_id = await save_signal_to_firestore(
+                    user_id=user_id,
+                    channel=chat_username,
+                    signal=signal,
+                    lot_size=lot_size,
+                    execution_mode=exec_mode,
+                    account_id=account_id,
+                )
+
+                # Auto-execute if mode is auto
+                if exec_mode == "auto":
+                    success = await forward_signal_to_webhook(
+                        user_id=user_id,
+                        account_id=account_id,
+                        signal=signal,
+                        lot_size=lot_size,
+                        channel=chat_username,
+                    )
+                    if doc_id:
+                        await update_signal_status(
+                            doc_id,
+                            "EXECUTED" if success else "FAILED",
+                            None if success else "Webhook forward failed"
+                        )
+                # Manual mode — signal stays PENDING for user to push/decline
 
             except Exception as e:
                 log.error(f"Message handler error: {e}")
 
-        await app.start()
-        me = await app.get_me()
-        log.info(f"✅ Client started: {me.first_name} ({user_id}) — {len(channels)} channels")
+        await tg_client.start()
+        me = await tg_client.get_me()
+        enabled_channels = [ch["username"] for ch in channels if ch.get("enabled")]
+        log.info(f"✅ Client: {me.first_name} ({user_id}) — {len(enabled_channels)} channels")
 
         active_clients[user_id] = {
-            "client": app,
+            "client":  tg_client,
             "channels": channels,
             "account_id": account_id,
         }
@@ -257,7 +420,6 @@ async def start_user_client(config: dict):
 
 
 async def stop_user_client(user_id: str):
-    """Stop a user's Pyrogram client"""
     if user_id not in active_clients:
         return
     try:
@@ -269,23 +431,28 @@ async def stop_user_client(user_id: str):
 
 
 async def sync_clients():
-    """Periodically sync active clients with Firestore configs"""
+    """Sync active clients with Firestore configs every minute"""
+    cleanup_counter = 0
     while True:
         try:
             configs = await get_user_configs()
             config_ids = {c["userId"] for c in configs}
 
-            # Stop removed clients
             for uid in list(active_clients.keys()):
                 if uid not in config_ids:
                     await stop_user_client(uid)
 
-            # Start new clients
             for config in configs:
                 if config["userId"] not in active_clients:
                     await start_user_client(config)
 
             log.info(f"Active clients: {len(active_clients)}")
+
+            # Cleanup old signals every hour (60 * 1min cycles)
+            cleanup_counter += 1
+            if cleanup_counter >= 60:
+                await cleanup_old_signals()
+                cleanup_counter = 0
 
         except Exception as e:
             log.error(f"Sync error: {e}")
@@ -294,7 +461,6 @@ async def sync_clients():
 
 
 async def health_server():
-    """Simple HTTP health check for Railway"""
     from aiohttp import web
 
     async def health(request):
@@ -304,11 +470,11 @@ async def health_server():
             "users": list(active_clients.keys()),
         })
 
-    app = web.Application()
-    app.router.add_get("/health", health)
-    app.router.add_get("/", health)
+    web_app = web.Application()
+    web_app.router.add_get("/health", health)
+    web_app.router.add_get("/", health)
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
