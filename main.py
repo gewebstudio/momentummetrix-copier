@@ -405,18 +405,26 @@ async def start_user_client(config: dict):
                 log.error(f"Message handler error: {e}")
 
         await tg_client.start()
-me = await tg_client.get_me()
+        me = await tg_client.get_me()
 
-# Populate peer cache by fetching all dialogs
-try:
-    async for _ in tg_client.get_dialogs():
-        pass
-    log.info("Peer cache populated")
-except Exception as e:
-    log.warning(f"Could not populate peer cache: {e}")
+        # Populate peer cache by fetching all dialogs
+        try:
+            async for _ in tg_client.get_dialogs():
+                pass
+            log.info("Peer cache populated")
+        except Exception as e:
+            log.warning(f"Could not populate peer cache: {e}")
 
-# Pre-cache monitored channels specifically
-for ch in channels:
+        # Pre-cache monitored channels specifically
+        for ch in channels:
+            try:
+                username = ch.get("username", "").strip("@")
+                if username:
+                    await tg_client.get_chat(username)
+                    log.info(f"Cached channel: @{username}")
+            except Exception as e:
+                log.warning(f"Could not cache {ch.get('username')}: {e}")
+
         enabled_channels = [ch["username"] for ch in channels if ch.get("enabled")]
         log.info(f"✅ Client: {me.first_name} ({user_id}) — {len(enabled_channels)} channels")
 
