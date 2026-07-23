@@ -124,8 +124,44 @@ async def options_handler(request):
 async def health(request):
     return web.json_response({"status": "ok", "service": "MomentumMetrix Telegram Copier"})
 
+import httpx
 
+async def get_channels(request):
+    try:
+        user_id = request.query.get("userId", "")
+        if not user_id:
+            return web.json_response({"error": "userId required"}, status=400)
+
+        url = f"https://firestore.googleapis.com/v1/projects/{os.environ.get('FIREBASE_PROJECT_ID', 'mt5-dashboard-bd063')}/databases/(default)/documents/telegram_copiers/{user_id}"
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return web.json_response({"error": "User not found"}, status=404)
+            data = resp.json()
+            session_string = data.get("fields", {}).get("sessionString", {}).get("stringValue", "")
+            if not session_string:
+                return web.json_response({"error": "No session"}, status=404)
+
+        app = Client(name=f"fetch_{user_id}", api_id=API_ID, api_hash=API_HASH, session_string=session_string, in_memory=True)
+        await app.start()
+        channels = []
+        async for dialog in app.get_dialogs():
+            chat = dialog.chat
+            if chat.type.name in ["CHANNEL", "SUPERGROUP", "GROUP"]:
+                channels.append({
+                    "id": str(chat.id),
+                    "title": chat.title or "",
+                    "username": f"@{chat.username}" if chat.username else str(chat.id),
+                    "type": chat.type.name.lower(),
+                    "members": chat.members_count or 0,
+                })
+        await app.stop()
+        return web.json_response({"channels": channels})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 async def start_auth_server():
+    app.router.add_get("/channels", get_channels)
+    app.router.add_options("/channels", options_handler)
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_post("/auth/send-otp", send_otp)
     app.router.add_post("/auth/verify-otp", verify_otp)
