@@ -10,8 +10,7 @@ from aiohttp import web
 
 log = logging.getLogger(__name__)
 
-_raw_id = os.environ['TELEGRAM_API_ID'].split('=')[-1].strip().split('\\n')[0].strip()
-API_ID  = int(_raw_id)
+API_ID   = int(os.environ['TELEGRAM_API_ID'])
 API_HASH = os.environ['TELEGRAM_API_HASH']
 PORT     = int(os.environ.get('PORT', 8000))
 
