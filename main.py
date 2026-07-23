@@ -19,11 +19,12 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Config from environment
-API_ID        = int(os.environ['TELEGRAM_API_ID'])
-API_HASH      = os.environ['TELEGRAM_API_HASH']
-WEBHOOK_BASE  = os.environ['WEBHOOK_BASE_URL']
+_raw_id      = os.environ['TELEGRAM_API_ID'].split('=')[-1].strip().split('\\n')[0].strip()
+API_ID       = int(_raw_id)
+API_HASH     = os.environ['TELEGRAM_API_HASH'].split('=')[-1].strip().split('\\n')[0].strip()
+WEBHOOK_BASE = os.environ['WEBHOOK_BASE_URL'].split('=')[-1].strip().split('\\n')[0].strip()
 FIREBASE_PROJECT = os.environ.get('FIREBASE_PROJECT_ID', 'mt5-dashboard-bd063')
-PORT          = int(os.environ.get('PORT', 8000))
+PORT         = int(os.environ.get('PORT', 8000))
 
 # Active Pyrogram clients per user
 # { userId: { client, channels } }
