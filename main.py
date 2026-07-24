@@ -424,7 +424,6 @@ async def stop_user_client(user_id: str):
 
 
 async def sync_clients():
-    """Sync active clients with Firestore configs every minute"""
     cleanup_counter = 0
     while True:
         try:
@@ -436,8 +435,22 @@ async def sync_clients():
                     await stop_user_client(uid)
 
             for config in configs:
-                if config["userId"] not in active_clients:
+                user_id = config["userId"]
+                if user_id not in active_clients:
                     await start_user_client(config)
+                else:
+                    # Check if channels changed — restart client if so
+                    current_channels = {
+                        ch["username"] for ch in active_clients[user_id].get("channels", [])
+                    }
+                    new_channels = {
+                        ch["username"] for ch in config.get("channels", [])
+                        if ch.get("enabled")
+                    }
+                    if current_channels != new_channels:
+                        log.info(f"Channel config changed for {user_id} — restarting client")
+                        await stop_user_client(user_id)
+                        await start_user_client(config)
 
             log.info(f"Active clients: {len(active_clients)}")
 
@@ -450,7 +463,7 @@ async def sync_clients():
         except Exception as e:
             log.error(f"Sync error: {e}")
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(10)
 
 
 async def health_server():
